@@ -1,29 +1,68 @@
 // =============================================================
-//  Robomatrix 2026 - Firmware control Xbox (Bluepad32, BLE)
-//  ESP32-S3-WROOM-1U
+//  BALAM 2026 - Todoterreno | Robomatrix
+//  ESP32-S3-WROOM-1U + IFX007T + Servo + 8 NeoPixels
+//  Control BLE por Bluepad32
 // =============================================================
 #include <Bluepad32.h>
+#include <Adafruit_NeoPixel.h>
 
-// ---------- Categoría ----------
-#define TODOTERRENO 0
-#define ROBOFUT     1
-#define CATEGORIA   ROBOFUT
+// ===== Compatibilidad core ESP32 2.x / 3.x =====
+#if ESP_ARDUINO_VERSION_MAJOR < 3
+static int8_t _pinCh[49];
+static bool   _pinChInit = false;
+static void _initPinCh() {
+  if (!_pinChInit) {
+    for (int i = 0; i < 49; i++) _pinCh[i] = -1;
+    _pinChInit = true;
+  }
+}
+bool ledcAttachChannel(uint8_t pin, uint32_t freq, uint8_t res, uint8_t ch) {
+  _initPinCh();
+  ledcSetup(ch, freq, res);
+  ledcAttachPin(pin, ch);
+  _pinCh[pin] = ch;
+  return true;
+}
+static void _ledcWritePin(uint8_t pin, uint32_t duty) {
+  _initPinCh();
+  if (_pinCh[pin] >= 0) ledcWrite((uint8_t)_pinCh[pin], duty);
+}
+#define ledcWrite(pin, duty) _ledcWritePin((pin), (duty))
+#endif
+// ===============================================
 
-#define TT_MOTOR    2      // Driver usado en Todoterreno (CN5, alimenta el servo)
+// ---------- Controles permitidos (MAC) ----------
+const uint8_t allowedMacs[][6] = {
+  {0x03, 0x25, 0x11, 0x14, 0x46, 0x7C},   // Steren
+  {0x8C, 0x41, 0xF2, 0xB5, 0x0F, 0xD8},   // Xbox
+};
+const int NUM_MACS = sizeof(allowedMacs) / 6;
 
-// ---------- Inversión de giro (cambie a 1 si un motor gira al revés) ----------
-#define INV_M1   0
-#define INV_M2   0
-#define INV_TBA  0
-#define INV_TBB  0
+// ---------- Ajustes ----------
+#define INV_MOTOR     0       // 1 si RT mueve hacia atrás
+#define DEBUG         0       // 1 = imprime valores cada 200 ms
 
-// ---------- Pines ----------
+#define SERVO_IZQ     160     // ángulo con stick a la izquierda
+#define SERVO_CENTRO  120
+#define SERVO_DER     80      // ángulo con stick a la derecha
+
+#define VEL_Y         870     // 85 % (máximo)
+#define VEL_B         716     // 70 %
+#define VEL_A         600     // 59 %
+
+#define DEADZONE      40      // stick (0..511) y gatillos (0..1023)
+#define SLEW_STEP     30      // rampa: cambio máximo cada 10 ms
+#define BRILLO        40      // NeoPixel 0..255
+
+// ---------- Pines: conector TT (M2) ----------
+#define M_IN1     18
+#define M_IN2     17
+#define M_INH     16
+
+// ---------- Pines que no se usan en Todoterreno (estado seguro) ----------
 #define M1_IN1    13
 #define M1_IN2    12
 #define M1_INH    11
-#define M2_IN1    18
-#define M2_IN2    17
-#define M2_INH    16
 #define PWMA      14
 #define AIN1       9
 #define AIN2      10
@@ -31,212 +70,186 @@
 #define BIN1      40
 #define BIN2      39
 #define STBY      41
+
 #define SERVO_PIN 21
 #define NEO_PIN   38
+#define NEO_COUNT  8
 
 // ---------- LEDC ----------
-#define CH_M1_IN1  0
-#define CH_M1_IN2  1
-#define CH_M2_IN1  2
-#define CH_M2_IN2  3
-#define CH_PWMA    4
-#define CH_PWMB    5
-#define CH_SERVO   6
-
+#define CH_IN1     2    // timer 1 - 20 kHz
+#define CH_IN2     3    // timer 1 - 20 kHz
+#define CH_SERVO   6    // timer 3 - 50 Hz
 #define MOTOR_FREQ 20000
 #define MOTOR_RES  10
-#define MOTOR_MAX  1023
 #define SERVO_FREQ 50
 #define SERVO_RES  14
 
-// ---------- Ajustes de manejo ----------
-#define DEADZONE      40      // zona muerta de sticks (0..511)
-#define SLEW_STEP     40      // cambio máximo por ciclo (rampa)
-#define SERVO_CENTER  90
-#define SERVO_RANGE   35      // grados a cada lado
-#define MICRO_SPEED   800     // velocidad de micromotores (0..1023)
-#define TIMEOUT_MS    300     // sin datos -> parar
-
+Adafruit_NeoPixel tira(NEO_COUNT, NEO_PIN, NEO_GRB + NEO_KHZ800);
 ControllerPtr ctl = nullptr;
-uint32_t lastData = 0;
-int curM1 = 0, curM2 = 0;
+int velMax   = VEL_Y;
+int velActual = 0;
+uint32_t colorModo;
 
 // =============================================================
 //  Hardware
 // =============================================================
-void ifxInit() {
-  pinMode(M1_INH, OUTPUT); digitalWrite(M1_INH, LOW);
-  pinMode(M2_INH, OUTPUT); digitalWrite(M2_INH, LOW);
-  ledcAttachChannel(M1_IN1, MOTOR_FREQ, MOTOR_RES, CH_M1_IN1);
-  ledcAttachChannel(M1_IN2, MOTOR_FREQ, MOTOR_RES, CH_M1_IN2);
-  ledcAttachChannel(M2_IN1, MOTOR_FREQ, MOTOR_RES, CH_M2_IN1);
-  ledcAttachChannel(M2_IN2, MOTOR_FREQ, MOTOR_RES, CH_M2_IN2);
-  ledcWrite(M1_IN1, 0); ledcWrite(M1_IN2, 0);
-  ledcWrite(M2_IN1, 0); ledcWrite(M2_IN2, 0);
+void pinesSeguros() {
+  const uint8_t p[] = {M1_IN1, M1_IN2, M1_INH, PWMA, AIN1, AIN2,
+                       PWMB, BIN1, BIN2, STBY, M_INH};
+  for (uint8_t x : p) { pinMode(x, OUTPUT); digitalWrite(x, LOW); }
 }
 
-void ifxSet(uint8_t motor, int speed) {
-  speed = constrain(speed, -MOTOR_MAX, MOTOR_MAX);
-  if ((motor == 1 && INV_M1) || (motor == 2 && INV_M2)) speed = -speed;
-  uint8_t in1 = (motor == 1) ? M1_IN1 : M2_IN1;
-  uint8_t in2 = (motor == 1) ? M1_IN2 : M2_IN2;
-  uint8_t inh = (motor == 1) ? M1_INH : M2_INH;
-  if (speed == 0) {
-    ledcWrite(in1, 0); ledcWrite(in2, 0);
-    digitalWrite(inh, LOW);
+void motorInit() {
+  ledcAttachChannel(M_IN1, MOTOR_FREQ, MOTOR_RES, CH_IN1);
+  ledcAttachChannel(M_IN2, MOTOR_FREQ, MOTOR_RES, CH_IN2);
+  ledcWrite(M_IN1, 0);
+  ledcWrite(M_IN2, 0);
+}
+
+void motorSet(int v) {
+  v = constrain(v, -VEL_Y, VEL_Y);
+  if (INV_MOTOR) v = -v;
+  if (v == 0) {
+    ledcWrite(M_IN1, 0); ledcWrite(M_IN2, 0);
+    digitalWrite(M_INH, LOW);
     return;
   }
-  digitalWrite(inh, HIGH);
-  if (speed > 0) { ledcWrite(in2, 0); ledcWrite(in1, speed); }
-  else           { ledcWrite(in1, 0); ledcWrite(in2, -speed); }
-}
-
-void tbInit() {
-  pinMode(STBY, OUTPUT); digitalWrite(STBY, LOW);
-  pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
-  pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
-  ledcAttachChannel(PWMA, MOTOR_FREQ, MOTOR_RES, CH_PWMA);
-  ledcAttachChannel(PWMB, MOTOR_FREQ, MOTOR_RES, CH_PWMB);
-  ledcWrite(PWMA, 0); ledcWrite(PWMB, 0);
-}
-
-void tbSet(char ch, int speed) {
-  speed = constrain(speed, -MOTOR_MAX, MOTOR_MAX);
-  if ((ch == 'A' && INV_TBA) || (ch == 'B' && INV_TBB)) speed = -speed;
-  uint8_t p  = (ch == 'A') ? PWMA : PWMB;
-  uint8_t d1 = (ch == 'A') ? AIN1 : BIN1;
-  uint8_t d2 = (ch == 'A') ? AIN2 : BIN2;
-  if (speed > 0)      { digitalWrite(d1, HIGH); digitalWrite(d2, LOW);  }
-  else if (speed < 0) { digitalWrite(d1, LOW);  digitalWrite(d2, HIGH); }
-  else                { digitalWrite(d1, LOW);  digitalWrite(d2, LOW);  }
-  ledcWrite(p, abs(speed));
+  digitalWrite(M_INH, HIGH);
+  if (v > 0) { ledcWrite(M_IN2, 0); ledcWrite(M_IN1, v); }
+  else       { ledcWrite(M_IN1, 0); ledcWrite(M_IN2, -v); }
 }
 
 void servoInit() {
   ledcAttachChannel(SERVO_PIN, SERVO_FREQ, SERVO_RES, CH_SERVO);
 }
 
-void servoWrite(int angle) {
-  angle = constrain(angle, 0, 180);
-  uint32_t us   = map(angle, 0, 180, 500, 2500);
-  uint32_t duty = (us * ((1UL << SERVO_RES) - 1)) / 20000;
-  ledcWrite(SERVO_PIN, duty);
+void servoWrite(int ang) {
+  ang = constrain(ang, min(SERVO_IZQ, SERVO_DER), max(SERVO_IZQ, SERVO_DER));
+  uint32_t us = map(ang, 0, 180, 500, 2400);
+  ledcWrite(SERVO_PIN, (us * ((1UL << SERVO_RES) - 1)) / 20000);
 }
 
-void neo(uint8_t r, uint8_t g, uint8_t b) { rgbLedWrite(NEO_PIN, r, g, b); }
-
-void stopAll() {
-  curM1 = 0; curM2 = 0;
-  ifxSet(1, 0); ifxSet(2, 0);
-  tbSet('A', 0); tbSet('B', 0);
-  digitalWrite(STBY, LOW);
-  servoWrite(SERVO_CENTER);
+void llenar(uint32_t c) {
+  for (int i = 0; i < NEO_COUNT; i++) tira.setPixelColor(i, c);
+  tira.show();
 }
 
-// Rampa: limita el cambio por ciclo para evitar picos de corriente
-int slew(int cur, int target) {
+void pararTodo() {
+  velActual = 0;
+  motorSet(0);
+  servoWrite(SERVO_CENTRO);
+}
+
+int rampa(int cur, int target) {
   if (target > cur + SLEW_STEP) return cur + SLEW_STEP;
   if (target < cur - SLEW_STEP) return cur - SLEW_STEP;
   return target;
 }
 
-// Stick (-511..512) -> (-1023..1023) con zona muerta
-int stickToSpeed(int v) {
-  if (abs(v) < DEADZONE) return 0;
-  return constrain(v * 2, -MOTOR_MAX, MOTOR_MAX);
-}
-
 // =============================================================
 //  Bluepad32
 // =============================================================
+bool macPermitida(const uint8_t* a) {
+  for (int i = 0; i < NUM_MACS; i++)
+    if (memcmp(a, allowedMacs[i], 6) == 0) return true;
+  return false;
+}
+
 void onConnected(ControllerPtr c) {
-  if (ctl == nullptr) {
-    ctl = c;
-    lastData = millis();
-    Serial.printf("Control conectado: %s\n", c->getModelName().c_str());
-    neo(0, 40, 0);
-  } else {
-    c->disconnect();   // solo un control a la vez
-  }
+  if (ctl != nullptr) { c->disconnect(); return; }   // solo un control a la vez
+
+  ctl = c;
+  velMax = VEL_Y;
+  colorModo = tira.Color(255, 200, 0);
+  Serial.printf("Conectado: %s\n", c->getModelName().c_str());
+  llenar(tira.Color(0, 255, 0));
 }
 
 void onDisconnected(ControllerPtr c) {
   if (ctl == c) {
     ctl = nullptr;
-    stopAll();
-    Serial.println("Control desconectado -> motores parados");
-    neo(40, 0, 0);
+    pararTodo();
+    Serial.println("Desconectado -> todo parado");
   }
 }
 
-void processController() {
-#if CATEGORIA == TODOTERRENO
-  // RT acelera, LT reversa (0..1023)
-  int target = ctl->throttle() - ctl->brake();
-  if (abs(target) < DEADZONE) target = 0;
+// =============================================================
+//  Control
+// =============================================================
+void procesar() {
+  // Modos de velocidad
+  if (ctl->y()) { velMax = VEL_Y; colorModo = tira.Color(255, 200, 0); }
+  if (ctl->b()) { velMax = VEL_B; colorModo = tira.Color(0, 80, 255); }
+  if (ctl->a()) { velMax = VEL_A; colorModo = tira.Color(0, 255, 0); }
 
-  int cur = (TT_MOTOR == 1) ? curM1 : curM2;
-  cur = slew(cur, target);
-  if (TT_MOTOR == 1) curM1 = cur; else curM2 = cur;
-  ifxSet(TT_MOTOR, cur);
+  // Tracción: RT adelante, LT atrás
+  int rt = ctl->throttle();
+  int lt = ctl->brake();
+  if (rt < DEADZONE) rt = 0;
+  if (lt < DEADZONE) lt = 0;
+  int objetivo = map(rt, 0, 1023, 0, velMax) - map(lt, 0, 1023, 0, velMax);
 
-  // Stick izquierdo X -> dirección
+  velActual = rampa(velActual, objetivo);
+  motorSet(velActual);
+
+  // Dirección: stick izquierdo X
   int x = ctl->axisX();
   if (abs(x) < DEADZONE) x = 0;
-  servoWrite(SERVO_CENTER + map(x, -511, 512, -SERVO_RANGE, SERVO_RANGE));
+  servoWrite(map(x, -512, 511, SERVO_IZQ, SERVO_DER));
 
-#else  // ROBOFUT
-  // Arcade: stick izq. Y = avance, stick der. X = giro
-  int thr  = -stickToSpeed(ctl->axisY());   // arriba = negativo en Bluepad32
-  int turn =  stickToSpeed(ctl->axisRX());
-
-  int tL = constrain(thr + turn, -MOTOR_MAX, MOTOR_MAX);
-  int tR = constrain(thr - turn, -MOTOR_MAX, MOTOR_MAX);
-  curM1 = slew(curM1, tL);
-  curM2 = slew(curM2, tR);
-  ifxSet(1, curM1);
-  ifxSet(2, curM2);
-
-  // RB adelante, LB atrás -> micromotores
-  int micro = 0;
-  if (ctl->r1()) micro =  MICRO_SPEED;
-  if (ctl->l1()) micro = -MICRO_SPEED;
-  digitalWrite(STBY, micro != 0 ? HIGH : LOW);
-  tbSet('A', micro);
-  tbSet('B', micro);
+#if DEBUG
+  static uint32_t t = 0;
+  if (millis() - t > 200) {
+    t = millis();
+    Serial.printf("RT:%4d LT:%4d LX:%4d | vel:%4d max:%4d\n",
+                  rt, lt, x, velActual, velMax);
+  }
 #endif
+}
+
+// NeoPixel: barra de velocidad en el color del modo
+void actualizarTira() {
+  static uint32_t t = 0;
+  if (millis() - t < 50) return;
+  t = millis();
+
+  if (!ctl) {                      // sin control: rojo parpadeando
+    static bool on = false;
+    on = !on;
+    llenar(on ? tira.Color(255, 0, 0) : 0);
+    return;
+  }
+
+  int n = map(abs(velActual), 0, VEL_Y, 1, NEO_COUNT);
+  tira.clear();
+  for (int i = 0; i < n; i++) tira.setPixelColor(i, colorModo);
+  if (velActual < 0) tira.setPixelColor(NEO_COUNT - 1, tira.Color(255, 0, 0));
+  tira.show();
 }
 
 // =============================================================
 //  Setup / Loop
 // =============================================================
 void setup() {
-  ifxInit();
-  tbInit();
+  pinesSeguros();
+  motorInit();
   servoInit();
-  stopAll();
+  pararTodo();
+
+  tira.begin();
+  tira.setBrightness(BRILLO);
+  llenar(tira.Color(255, 0, 0));
 
   Serial.begin(115200);
-  neo(40, 0, 0);   // rojo = sin control
-
   BP32.setup(&onConnected, &onDisconnected);
-  // BP32.forgetBluetoothKeys();   // descomente para borrar controles emparejados
-
-  Serial.println("Esperando control Xbox...");
+  BP32.forgetBluetoothKeys();
+  BP32.enableVirtualDevice(false);
+  Serial.println("BALAM Todoterreno - esperando control...");
 }
 
 void loop() {
-  bool updated = BP32.update();
-
-  if (ctl && ctl->isConnected()) {
-    if (updated && ctl->hasData()) {
-      lastData = millis();
-      processController();
-    }
-    if (millis() - lastData > TIMEOUT_MS) {
-      stopAll();   // failsafe: sin datos recientes
-    }
-  }
-
+  BP32.update();
+  if (ctl && ctl->isConnected()) procesar();
+  actualizarTira();
   delay(10);
 }
